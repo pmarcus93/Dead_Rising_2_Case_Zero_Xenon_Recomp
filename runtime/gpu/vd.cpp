@@ -48,6 +48,39 @@ std::atomic<uint32_t> g_rptrWriteback{ 0 };
 std::atomic<uint32_t> g_gpuIdentifier{ 0 };
 std::atomic<bool> g_pumpRunning{ false };
 
+// The write pointer the pump walks to, and the one place it is read.
+//
+// The kick site `sub_82845698` stores the MIRROR, then `sync`, then CP_RB_WPTR (vd.h).
+// On x86 the choice between them is free: TSO keeps every store the guest made before
+// the mirror visible before the mirror. ARM64 does not. The mirror can be seen by the
+// pump's core ahead of the packets it covers, and the walk then reads ring/IB memory
+// the guest has not finished writing — the first macOS runs printed `indirect buffer
+// TRUNCATED` over a record list and then faulted or froze. The register is stored
+// AFTER the guest's barrier (a real `dmb ish` on arm64, XenonRecomp patch 0014), which
+// is the word real hardware reads; the acquire fence then keeps our own later loads of
+// ring memory from being satisfied before this one. x86 keeps the mirror, unchanged.
+// CZ_RING_WPTR_MIRROR=1 is the control arm on arm64.
+uint32_t LoadKickedWptr(uint8_t* base, uint32_t userData)
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const bool mirror = [] {
+        const bool m = getenv("CZ_RING_WPTR_MIRROR") != nullptr;
+        KLOG("ring write pointer: %s\n",
+             m ? "the device MIRROR (CZ_RING_WPTR_MIRROR — the x86 choice, unordered on "
+                 "arm64)"
+               : "CP_RB_WPTR + acquire (arm64 default; CZ_RING_WPTR_MIRROR=1 is the "
+                 "control)");
+        return m;
+    }();
+    const uint32_t w = mirror ? PPC_LOAD_U32(userData + kDeviceKickedWptr)
+                              : PPC_LOAD_U32(kCpRbWptrAddress);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return w;
+#else
+    return PPC_LOAD_U32(userData + kDeviceKickedWptr);
+#endif
+}
+
 // Physical addresses reach us through MmGetPhysicalAddress, which answers with
 // `address & 0x1FFFFFFF`. Our physical arena is the cached view at 0xA0000000
 // (kernel/heap.cpp), so the way back is a single OR — the exact inverse, which is
@@ -642,7 +675,7 @@ void GraphicsInterruptPump()
                 return off;
             }();
             Pm4_SetRptrPublishSlot(noMidwalk ? 0 : g_rptrWriteback.load());
-            const uint32_t kickedWptr = PPC_LOAD_U32(userData + kDeviceKickedWptr);
+            const uint32_t kickedWptr = LoadKickedWptr(base, userData);
             const uint64_t tWalk = NowNs();
             g_pumpWalkStartNs.store(tWalk, std::memory_order_relaxed);
             const uint32_t cursor = Pm4_Execute(base, kickedWptr);
